@@ -8,6 +8,8 @@ import android.content.Intent
 import android.content.IntentFilter
 import android.net.ConnectivityManager
 import android.os.Build
+import android.os.Handler
+import android.os.Looper
 import android.os.ParcelFileDescriptor
 import android.system.OsConstants
 import androidx.core.content.ContextCompat
@@ -46,6 +48,8 @@ import java.net.InetSocketAddress
 
 object CoreServiceManager {
 
+    private const val START_COMMAND_TIMEOUT_MS = 3000L
+
     private val coreController: CoreController = CoreNativeManager.newCoreController(CoreCallback())
     private val mMsgReceive = ReceiveMessageHandler()
     private var currentConfig: ProfileItem? = null
@@ -59,6 +63,10 @@ object CoreServiceManager {
 
     /** Tun descriptor the core was started with, null in the proxy only and root run modes. */
     private var currentVpnInterface: ParcelFileDescriptor? = null
+
+    private val mainHandler = Handler(Looper.getMainLooper())
+    private var awaitingStartCommand = false
+    private val startCommandTimeout = Runnable { stopServiceWithoutStartCommand() }
 
     var serviceControl: SoftReference<ServiceControl>? = null
         set(value) {
@@ -76,6 +84,44 @@ object CoreServiceManager {
      * @return True if the service is running, false otherwise.
      */
     fun isRunning() = coreController.isRunning
+
+    /**
+     * Arms the missing start command check, call from onCreate of every core service.
+     *
+     * ColorOS 16 (Android 16) kills the daemon process when the app is swiped away in recents, then
+     * re-creates the START_STICKY service and re-posts its last foreground notification without ever
+     * calling onStartCommand. Nothing is set up in that process, so the stale notification stays
+     * forever, its buttons reach no receiver and the UI reports the core as stopped.
+     *
+     * The system re-posts that notification from the foreground state the killed process left on
+     * the service record, so it is removed here at once instead of when the check fires.
+     * stopForeground is a no-op for a service that is not foreground, so a normal start, which
+     * enters foreground in onStartCommand, is unaffected.
+     * Remove once no supported ROM re-creates a started service without calling onStartCommand.
+     */
+    fun onServiceCreated(service: Service) {
+        service.stopForeground(Service.STOP_FOREGROUND_REMOVE)
+        awaitingStartCommand = true
+        mainHandler.removeCallbacks(startCommandTimeout)
+        mainHandler.postDelayed(startCommandTimeout, START_COMMAND_TIMEOUT_MS)
+    }
+
+    /**
+     * Disarms the missing start command check, call first in onStartCommand of every core service.
+     */
+    fun onStartCommandReceived() {
+        awaitingStartCommand = false
+        mainHandler.removeCallbacks(startCommandTimeout)
+    }
+
+    private fun stopServiceWithoutStartCommand() {
+        if (!shouldStopUnstartedService(awaitingStartCommand, isRunning())) return
+        val service = getService() ?: return
+        LogUtil.w(AppConfig.TAG, "StartCore-Manager: ${service.javaClass.simpleName} created without a start command, stopping")
+        awaitingStartCommand = false
+        NotificationManager.cancelNotification()
+        service.stopSelf()
+    }
 
     /**
      * Gets the name of the currently running server.
@@ -519,3 +565,10 @@ object CoreServiceManager {
         }
     }
 }
+
+/**
+ * Whether a core service that was created without a start command must stop itself,
+ * see [CoreServiceManager.onServiceCreated].
+ */
+internal fun shouldStopUnstartedService(awaitingStartCommand: Boolean, coreRunning: Boolean): Boolean =
+    awaitingStartCommand && !coreRunning
